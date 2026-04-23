@@ -18,21 +18,43 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
     NoAlertPresentException,
 )
+from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
 from dotenv import load_dotenv
 
 # --- Configuration ---
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+_log_file = os.path.join(LOG_DIR, f"dispatch_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_file, encoding="utf-8"),
+    ],
 )
 log = logging.getLogger(__name__)
+log.info("Log file: %s", _log_file)
 
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads_dispatch_summary")
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads_dispatch_summary")
 FINAL_FILENAME = "Dispatch_summary.csv"
+
+
+def get_date_batches():
+    """Returns 3 (start, end) date pairs of 10 days each covering the last 30 days, oldest first."""
+    today = datetime.now().date()
+    batches = []
+    for i in range(3):
+        end = today - timedelta(days=i * 10)
+        start = today - timedelta(days=(i + 1) * 10 - 1)
+        batches.append((start, end))
+    return list(reversed(batches))
 
 
 # ──────────────────────────────────────────────
@@ -48,6 +70,10 @@ def setup_driver(download_dir):
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-notifications")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
     options.add_experimental_option("prefs", {
         "download.default_directory": download_dir,
         "download.prompt_for_download": False,
@@ -133,7 +159,11 @@ def vinculum_login(driver):
         pass
 
     log.info("Waiting for dashboard to load after login...")
-    WebDriverWait(driver, 60).until(
+    time.sleep(15)
+    log.info("Current URL: %s", driver.current_url)
+    driver.save_screenshot(os.path.join(DOWNLOAD_DIR, "post_login.png"))
+    log.info("Screenshot saved: post_login.png")
+    WebDriverWait(driver, 120).until(
         EC.presence_of_element_located((By.XPATH, "//a[.//span[contains(text(), 'WMS')]]"))
     )
     log.info("Vinculum dashboard loaded.")
@@ -165,24 +195,96 @@ def navigate_to_dispatch_report(driver):
     js_click(driver, dispatch_link)
 
 
-def apply_filter_and_print(driver):
-    log.info("Applying 'Last 30 Days' filter on Dispatch Date...")
+def apply_filter_and_print(driver, start_date, end_date):
+    date_fmt = "%d/%m/%Y"
+    start_str = start_date.strftime(date_fmt)
+    end_str = end_date.strftime(date_fmt)
+    log.info("Applying date filter: %s to %s", start_str, end_str)
+
     date_field = find_element_across_iframes(
         driver, ".form-control[name*='Date'], input[id*='Date']", timeout=10
     )
-    js_click(driver, date_field)
-    time.sleep(2)
 
-    last_30_opt = find_element_across_iframes(
-        driver, "//li[contains(text(), 'Last 30 Days')]", by=By.XPATH
-    )
-    js_click(driver, last_30_opt)
+    # Try jQuery daterangepicker API — check current window AND parent window
+    # because the picker may be initialised in the parent frame when inside an iframe
+    set_via_js = driver.execute_script("""
+        var el = arguments[0], start = arguments[1], end = arguments[2];
+        var contexts = [window, window.parent, window.top];
+        for (var i = 0; i < contexts.length; i++) {
+            try {
+                var $ = contexts[i].jQuery || contexts[i].$;
+                if ($ && $(el).data('daterangepicker')) {
+                    var picker = $(el).data('daterangepicker');
+                    picker.setStartDate(start);
+                    picker.setEndDate(end);
+                    picker.clickApply();
+                    return 'api:ctx' + i;
+                }
+            } catch(e) {}
+        }
+        return false;
+    """, date_field, start_str, end_str)
 
-    apply_btn = find_element_across_iframes(
-        driver, "//button[contains(text(), 'Apply')]", by=By.XPATH
-    )
-    js_click(driver, apply_btn)
-    time.sleep(1)
+    if set_via_js:
+        log.info("Dates set via jQuery API (%s).", set_via_js)
+        time.sleep(1)
+    else:
+        # Open the picker, click Custom Range, then inject dates via JS only
+        # (no switch_to.default_content — that crashes Chrome; no ActionChains
+        #  on invisible elements)
+        log.info("jQuery API unavailable — opening picker and injecting dates via JS...")
+        js_click(driver, date_field)
+        time.sleep(2)
+
+        try:
+            custom = find_element_across_iframes(
+                driver, "//li[contains(text(), 'Custom Range')]", by=By.XPATH, timeout=5
+            )
+            js_click(driver, custom)
+            time.sleep(1.5)
+        except TimeoutException:
+            pass
+
+        date_set = driver.execute_script("""
+            var start = arguments[0], end = arguments[1];
+            function setVal(el, val) {
+                el.removeAttribute('readonly');
+                el.style.display = 'block';
+                el.style.visibility = 'visible';
+                var setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input',  {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+            }
+            var si = document.querySelector(
+                'input[name="daterangepicker_start"], .daterangepicker input.input-mini');
+            var ei = document.querySelector('input[name="daterangepicker_end"]');
+            if (!ei) {
+                var minis = document.querySelectorAll('.daterangepicker input.input-mini');
+                if (minis.length > 1) ei = minis[1];
+            }
+            if (!si) return false;
+            setVal(si, start);
+            if (ei) setVal(ei, end);
+            return true;
+        """, start_str, end_str)
+
+        if date_set:
+            log.info("Dates injected via JS value setter.")
+        else:
+            log.warning("Could not locate picker inputs — report will use previous filter.")
+        time.sleep(0.5)
+
+        try:
+            apply_btn = find_element_across_iframes(
+                driver, "//button[contains(text(), 'Apply')]", by=By.XPATH, timeout=5
+            )
+            js_click(driver, apply_btn)
+        except TimeoutException:
+            pass
+        time.sleep(1)
 
     log.info("Clicking 'Print' to generate report...")
     print_btn = find_element_across_iframes(
@@ -190,6 +292,57 @@ def apply_filter_and_print(driver):
     )
     js_click(driver, print_btn)
     time.sleep(5)
+
+
+def navigate_back_to_report(driver):
+    """Go back to the Dispatch Report filter tab for the next batch."""
+    log.info("Navigating back to Dispatch Report filter page...")
+    try:
+        report_tab = find_element_across_iframes(
+            driver,
+            "//ul[contains(@class,'nav-tabs')]//a[not(contains(text(),'Pending')) and contains(text(),'Report')]",
+            by=By.XPATH,
+            timeout=5,
+        )
+        js_click(driver, report_tab)
+        time.sleep(2)
+    except TimeoutException:
+        log.info("Tab not found, re-navigating via sidebar...")
+        navigate_to_dispatch_report(driver)
+
+    # Click Reset to clear previous filter if available
+    try:
+        reset_btn = find_element_across_iframes(
+            driver,
+            "//button[contains(text(),'Reset')] | //input[@value='Reset']",
+            by=By.XPATH,
+            timeout=5,
+        )
+        js_click(driver, reset_btn)
+        time.sleep(1)
+    except TimeoutException:
+        pass
+
+
+def merge_batch_files(file_list, output_path):
+    """Merge multiple CSVs into one deduplicated file."""
+    dfs = []
+    for f in file_list:
+        try:
+            df = pd.read_csv(f, low_memory=False)
+            log.info("Read %d rows from %s", len(df), os.path.basename(f))
+            dfs.append(df)
+        except Exception as e:
+            log.warning("Could not read %s: %s", f, e)
+
+    if not dfs:
+        raise ValueError("No batch data to merge.")
+
+    merged = pd.concat(dfs, ignore_index=True).drop_duplicates()
+    log.info("Merged total: %d rows (after dedup)", len(merged))
+    merged.to_csv(output_path, index=False)
+    log.info("Merged file saved: %s", output_path)
+    return output_path
 
 
 def poll_and_download(driver):
@@ -293,7 +446,130 @@ def delete_zoho_data(workspace_id, view_id, criteria):
         return False
 
 
-def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="%d/%m/%Y %I:%M %p", max_chunk_mb=19):
+GEO_COLUMNS = ["City", "State", "Country"]
+
+# Known state name corrections for Zoho geo validation
+STATE_NORMALIZATIONS = {
+    "andhra prasesh": "Andhra Pradesh",
+    "gujrat": "Gujarat",
+    "harayana": "Haryana",
+    "karantaka": "Karnataka",
+    "maharastra": "Maharashtra",
+    "maharshtra": "Maharashtra",
+    "mahrashtra": "Maharashtra",
+    "telagana": "Telangana",
+    "chhatishgarh": "Chhattisgarh",
+    "chattisgarh": "Chhattisgarh",
+    "jammu kashmir": "Jammu & Kashmir",
+    "jammu and kashmir": "Jammu & Kashmir",
+    "delhi ncr": "Delhi",
+    "daman and diu": "Daman and Diu",
+    "india": None,
+    "orissa": "Odisha",
+    "uttarpradesh": "Uttar Pradesh",
+    "uttrakhand": "Uttarakhand",
+    "dadra and nagar haveli": None,
+    "daman and diu": None,
+}
+
+def clean_geo_columns(df):
+    invalid_markers = {"-", ".", " ", ""}
+    for col in GEO_COLUMNS:
+        if col not in df.columns:
+            continue
+        df[col] = df[col].apply(
+            lambda v: None if (pd.isna(v) or str(v).strip() in invalid_markers) else str(v).strip()
+        )
+        if col == "City":
+            df[col] = df[col].apply(lambda v: None if (pd.notna(v) and v is not None and len(str(v)) < 2) else v)
+            territory_names = {"dadra and nagar haveli", "daman and diu", "andaman and nicobar islands"}
+            df[col] = df[col].apply(
+                lambda v: None if (v is not None and pd.notna(v) and str(v).lower() in territory_names) else v
+            )
+        if col == "State":
+            def _norm_state(v):
+                if pd.isna(v) or v is None:
+                    return None
+                return STATE_NORMALIZATIONS.get(str(v).lower(), v)
+            df[col] = df[col].apply(_norm_state)
+    return df
+
+
+def clean_data_types(df):
+    # Customer Zip must be a positive number — clear non-numeric values
+    if "Customer Zip" in df.columns:
+        df["Customer Zip"] = pd.to_numeric(df["Customer Zip"], errors="coerce")
+
+    # OutBound Type is incorrectly typed as Geo in Zoho view — clear unrecognized values
+    # TODO: fix OutBound Type column type to Plain Text in Zoho Analytics UI to restore STO data
+    if "OutBound Type" in df.columns:
+        valid_outbound = {"SO", "RTV"}
+        df["OutBound Type"] = df["OutBound Type"].apply(
+            lambda v: None if (pd.isna(v) or str(v).strip().upper() not in valid_outbound) else v
+        )
+    return df
+
+
+_DATE_FORMATS = [
+    "%d-%m-%Y %H:%M:%S",   # 25-03-2026 13:30:00  ← Vinculum confirmed format
+    "%d-%m-%Y %H:%M",      # 25-03-2026 13:30
+    "%d-%m-%Y",            # 25-03-2026
+    "%d/%m/%Y %I:%M %p",   # 25/03/2026 01:30 PM
+    "%d/%m/%Y %H:%M:%S",   # 25/03/2026 13:30:00
+    "%d/%m/%Y %H:%M",      # 25/03/2026 13:30
+    "%d/%m/%Y",            # 25/03/2026
+    "%m/%d/%Y %I:%M %p",   # 03/25/2026 01:30 PM  (US format)
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y",
+    "%Y-%m-%d %H:%M:%S",   # ISO
+    "%Y-%m-%d",
+]
+
+
+def parse_dates_robust(series, hint_format=None):
+    """Try multiple date formats, pick the one with the fewest NaTs, and
+    null out any remaining values whose year is unreasonably far in the future."""
+    sample = series.dropna().head(5).tolist()
+    log.info("Date sample (raw): %s", sample)
+
+    formats = ([hint_format] if hint_format else []) + _DATE_FORMATS
+    best, best_valid, best_fmt = None, -1, hint_format or "unknown"
+
+    total_non_null = max(series.notna().sum(), 1)
+    for fmt in formats:
+        try:
+            parsed = pd.to_datetime(series, format=fmt, errors="coerce")
+        except Exception:
+            continue
+        valid = int(parsed.notna().sum())
+        if valid > best_valid:
+            best_valid, best, best_fmt = valid, parsed, fmt
+        if valid >= 0.9 * total_non_null:
+            break
+
+    log.info("Best date format: '%s'  (%d / %d values parsed)", best_fmt, best_valid, total_non_null)
+
+    # Null out dates with clearly wrong years (data-entry errors, etc.)
+    current_year = datetime.now().year
+    if best is not None:
+        bad_mask = best.dt.year > current_year + 1
+        if bad_mask.sum():
+            log.warning(
+                "Nulling %d dates with year > %d: %s",
+                bad_mask.sum(), current_year + 1,
+                best[bad_mask].dt.year.value_counts().to_dict(),
+            )
+            best = best.where(~bad_mask, other=pd.NaT)
+
+        too_old = best.dt.year < 2010
+        if too_old.sum():
+            log.warning("Nulling %d dates with year < 2010", too_old.sum())
+            best = best.where(~too_old, other=pd.NaT)
+
+    return best
+
+
+def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="%d/%m/%Y %I:%M %p", num_batches=6):
     if not os.path.exists(file_path):
         log.error("File not found: %s", file_path)
         return False
@@ -305,6 +581,8 @@ def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="
         df = pd.read_excel(file_path)
 
     df = df.replace([float("inf"), float("-inf")], None)
+    df = clean_geo_columns(df)
+    df = clean_data_types(df)
 
     # Convert float columns that should be integers (e.g. 3.0 → 3)
     for col in df.columns:
@@ -312,14 +590,26 @@ def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="
             if df[col].dropna().apply(lambda x: x == int(x) if pd.notnull(x) else True).all():
                 df[col] = df[col].astype("Int64")
 
-    if date_cols:
-        for col in date_cols:
-            if col in df.columns:
-                log.info("Reformatting date column: %s", col)
-                df[col] = pd.to_datetime(df[col], format=date_format, errors="coerce")
-                df[col] = df[col].apply(
-                    lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(x) else None
-                )
+    # Auto-collect date columns: explicit list + any column whose name contains
+    # 'date' or 'time' (case-insensitive) that we haven't already listed.
+    all_date_cols = list(date_cols or [])
+    for col in df.columns:
+        if col not in all_date_cols and any(k in col.lower() for k in ("date", "time")):
+            all_date_cols.append(col)
+
+    for col in all_date_cols:
+        if col not in df.columns:
+            continue
+        # Parse from Vinculum's DD/MM/YYYY HH:MM AM/PM format, then output as
+        # ISO (YYYY-MM-DD HH:MM:SS). ISO is unambiguous — year first means Zoho
+        # cannot confuse day/month. autoIdentify:true in import_config lets Zoho
+        # detect ISO automatically regardless of the column's display format.
+        parsed = parse_dates_robust(df[col], hint_format=date_format)
+        df[col] = parsed.apply(
+            lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(x) else None
+        )
+        log.info("'%s' sample after ISO conversion: %s",
+                 col, df[col].dropna().head(3).tolist())
 
     total = len(df)
     log.info("Total rows to push: %d", total)
@@ -327,20 +617,21 @@ def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="
     if total == 0:
         return True
 
-    # Calculate batch size to keep CSV chunks under max_chunk_mb
-    sample_csv = df.head(100).to_csv(index=False).encode("utf-8")
-    avg_row_bytes = len(sample_csv) / min(100, total)
-    batch_size = max(100, int((max_chunk_mb * 1024 * 1024) / avg_row_bytes))
+    # Fixed number of batches
+    batch_size = max(1, -(-total // num_batches))  # ceiling division
     total_batches = (total + batch_size - 1) // batch_size
-    log.info("Batch size: %d rows (~%.1f MB each), %d batches", batch_size, (batch_size * avg_row_bytes) / (1024 * 1024), total_batches)
+    log.info("Batch size: %d rows per batch, %d batches", batch_size, total_batches)
 
     headers = zoho_headers()
     url = f"https://analyticsapi.zoho.in/restapi/v2/workspaces/{workspace_id}/views/{view_id}/data"
 
     import_config = json.dumps({
-        "importType": "append",
+        "importType": "updateadd",
         "fileType": "csv",
-        "autoIdentify": "true",
+        "autoIdentify": "true",   # let Zoho detect column types & date formats automatically
+        "delimiter": "0",
+        "quoted": "2",
+        "matchingColumns": ["Delivery No"],
     })
 
     all_success = True
@@ -350,6 +641,7 @@ def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="
         batch_csv = batch_df.to_csv(index=False)
         batch_mb = len(batch_csv.encode("utf-8")) / (1024 * 1024)
         log.info("Pushing batch %d/%d (%d rows, %.1f MB)...", batch_num, total_batches, len(batch_df), batch_mb)
+
 
         resp = requests.post(
             url,
@@ -376,49 +668,74 @@ def push_to_zoho(file_path, workspace_id, view_id, date_cols=None, date_format="
 def main():
     log.info("=== Dispatch Summary Automation ===")
     driver = None
+    downloaded_files = []
     try:
-        # 1. Download report from Vinculum
         driver = setup_driver(DOWNLOAD_DIR)
         vinculum_login(driver)
         navigate_to_dispatch_report(driver)
-        apply_filter_and_print(driver)
 
-        start_time = time.time()
-        poll_and_download(driver)
-        file_path = wait_for_download(DOWNLOAD_DIR, start_time)
+        batches = get_date_batches()
 
-        if not file_path:
-            log.error("FAILED: No file downloaded.")
+        # Download one batch at a time
+        for batch_num, (start_date, end_date) in enumerate(batches, 1):
+            log.info("--- Batch %d/3: %s to %s ---", batch_num, start_date, end_date)
+
+            if batch_num > 1:
+                navigate_back_to_report(driver)
+
+            apply_filter_and_print(driver, start_date, end_date)
+
+            start_time = time.time()
+            poll_and_download(driver)
+            file_path = wait_for_download(DOWNLOAD_DIR, start_time)
+
+            if not file_path:
+                log.error("Batch %d: No file downloaded. Skipping.", batch_num)
+                continue
+
+            batch_path = os.path.join(DOWNLOAD_DIR, f"batch_{batch_num}.csv")
+            if os.path.exists(batch_path):
+                os.remove(batch_path)
+            os.rename(file_path, batch_path)
+            downloaded_files.append(batch_path)
+            log.info("Batch %d saved: %s", batch_num, batch_path)
+
+        if not downloaded_files:
+            log.error("FAILED: No batches downloaded.")
             return
 
-        # Rename to final filename
+        # Merge all batches into one file
         final_path = os.path.join(DOWNLOAD_DIR, FINAL_FILENAME)
         if os.path.exists(final_path):
             os.remove(final_path)
-        os.rename(file_path, final_path)
-        log.info("Report saved: %s", final_path)
+        merge_batch_files(downloaded_files, final_path)
 
-        # 2. Delete last 30 days from Zoho
+        # Push merged data to Zoho
         workspace_id = os.getenv("ZOHO_WORKSPACE_ID")
         view_id = os.getenv("ZOHO_DISPATCH_VIEW_ID")
-        twenty_nine_days_ago = (datetime.now() - timedelta(days=29)).strftime("%Y-%m-%d 00:00:00")
-        criteria = f"\"Ship Date\" >= \'{twenty_nine_days_ago}\'"
 
-        log.info("Cleaning up last 30 days in Zoho...")
-        delete_success = delete_zoho_data(workspace_id, view_id, criteria)
+        # Delete any rows with obviously wrong future dates left over from earlier bad runs
+        current_year = datetime.now().year
+        bad_date_criteria = f'"Order Date" > \'{current_year + 1}-01-01\''
+        log.info("Deleting bad-year rows from Zoho (criteria: %s)...", bad_date_criteria)
+        delete_zoho_data(workspace_id, view_id, bad_date_criteria)
 
-        # 3. Push new data to Zoho
-        log.info("Pushing Dispatch Summary data to Zoho...")
+        log.info("Pushing merged Dispatch Summary data to Zoho...")
         push_success = push_to_zoho(
-            final_path, workspace_id, view_id, date_cols=["Dispatch Date"]
+            final_path, workspace_id, view_id,
+            date_cols=["Order Date", "Delivery Date", "Ship Date", "Invoice Date"],
+            date_format="%d/%m/%Y %I:%M %p",
         )
 
-        if delete_success and push_success:
+        if push_success:
             log.info("SUCCESS: Dispatch Summary pipeline complete.")
             os.remove(final_path)
-            log.info("Cleaned up downloaded CSV: %s", final_path)
+            for f in downloaded_files:
+                if os.path.exists(f):
+                    os.remove(f)
+            log.info("Cleaned up all batch and merged CSV files.")
         else:
-            log.error("FAILED: Zoho operations were not fully successful. CSV kept for retry.")
+            log.error("FAILED: Zoho push was not successful. CSVs kept for retry.")
 
     except Exception:
         log.exception("Automation FAILED.")
